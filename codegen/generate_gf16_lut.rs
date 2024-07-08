@@ -1,5 +1,5 @@
-use std::io::Write;
 use std::fs;
+use std::io::Write;
 
 use da_proof::gf16::GF16LUT;
 

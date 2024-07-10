@@ -16,7 +16,7 @@ pub struct ReedSolomon {
     polynomial: Poly,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct Message(Vec<u16>);
 
 trait AsPoly {
@@ -187,10 +187,11 @@ mod test {
     #[test]
     fn correct_errata() {
         let rs = ReedSolomon::new(8);
-        let mut encoded = rs.encode(&[1234, 4321]).unwrap();
-        encoded.0[0] = 0;
-        println!("CORRUPTED: {:?}", encoded);
-        let corrected = rs.correct_errata(&encoded, &[0]);
-        todo!("CORRECTED: {:?}", corrected);
+        let encoded = rs.encode(&[1234, 4321]).unwrap();
+        let mut corrupted = encoded.clone();
+        corrupted.0[0] = 0;
+        let corrected = rs.correct_errata(&corrupted, &[0]).unwrap();
+
+        assert_eq!(corrected.0, encoded.0);
     }
 }

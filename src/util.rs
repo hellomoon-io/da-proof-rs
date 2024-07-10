@@ -2,6 +2,21 @@ use std::mem::size_of;
 
 use num::PrimInt;
 
+#[derive(Debug, Clone, Copy)]
+pub enum Axis {
+    Row,
+    Col,
+}
+
+impl std::fmt::Display for Axis {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Axis::Row => write!(f, "Row"),
+            Axis::Col => write!(f, "Col"),
+        }
+    }
+}
+
 pub trait BitLength: Sized {
     const BITS: usize = size_of::<Self>() * 8;
 

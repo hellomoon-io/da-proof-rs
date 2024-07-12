@@ -1,5 +1,7 @@
-use anyhow::{anyhow, ensure};
+use crate::util::{as_chunks, as_chunks_mut, as_flat, invariant, sqrt_ceil};
+use anyhow::anyhow;
 use bisetmap::BisetMap;
+use generic_array::{ArrayLength, GenericArray};
 use grid::Grid;
 use itertools::Itertools;
 use num::integer::sqrt;
@@ -7,74 +9,56 @@ use reed_solomon_erasure::galois_16::ReedSolomon;
 use rs_merkle::algorithms::Sha256;
 use rs_merkle::{Hasher, MerkleTree};
 
-use crate::util::Axis;
-
-/// Type aliases
-
-pub type Share<const SHARE_SIZE: usize> = [u8; SHARE_SIZE];
-pub type MerkleRoot = [u8; 32];
-type Square<const SHARE_SIZE: usize> = Grid<Share<SHARE_SIZE>>;
+use crate::common::{new_share, Axis, MerkleRoot, NonZeroMultipleOf64, Share, Square};
+use crate::error::{ByzantineData, DataNotSquare, TooManyErasures};
 
 /// A "square" of data aligned into `Share`s.
 ///
 /// *Invariant*: the data is square, i.e. the grid is equally as wide as it is high.
 #[derive(Debug, Clone)]
-pub struct DataSquare<const SHARE_SIZE: usize>(Square<SHARE_SIZE>);
+pub struct DataSquare<Sz: NonZeroMultipleOf64>(Square<Sz>);
 
 /// An extended "square" of data.
 ///
 /// This includes the erasure encoded data derived from the original `DataSquare`.
 #[derive(Debug, Clone)]
-pub struct ExtendedDataSquare<const SHARE_SIZE: usize> {
+pub struct ExtendedDataSquare<Sz: NonZeroMultipleOf64> {
     original_width: usize,
-    square: DataSquare<SHARE_SIZE>,
+    square: DataSquare<Sz>,
     row_roots: Vec<MerkleRoot>,
     col_roots: Vec<MerkleRoot>,
 }
 
-/// An error that is returned when Byzantine (invalid, malicious, etc.) data is detected.
-///
-/// This can be a result of the shares in an axis not matching the known Merkle roots,
-/// or recovery data that doesn't match the original.
-#[derive(Debug)]
-pub struct ByzantineDataError<const SHARE_SIZE: usize> {
-    /// The axis on which Byzantine data was detected
-    axis: Axis,
-    /// The index of the axis on which Byzantine data was detected
-    idx: usize,
-    /// The shares that could be used to construct a fraud proof.
-    shares: Option<Vec<Share<SHARE_SIZE>>>,
-}
+/// A two way map of missing shares in an EDS
+type MissingMap = BisetMap<usize, usize>;
 
-impl<const SHARE_SIZE: usize> ByzantineDataError<SHARE_SIZE> {
+impl<Sz: NonZeroMultipleOf64> ByzantineData<Sz> {
     /// Constructs a new `ByzantineDataError` with `shares` populated.
-    fn new_with_shares(eds: &ExtendedDataSquare<SHARE_SIZE>, axis: Axis, idx: usize) -> Self {
+    fn new_from_eds(eds: &ExtendedDataSquare<Sz>, axis: Axis, idx: usize) -> Self {
         Self {
             axis,
             idx,
-            shares: Some(
-                (match axis {
-                    Axis::Row => eds.square.0.iter_row(idx),
-                    Axis::Col => eds.square.0.iter_col(idx),
-                })
-                .map(ToOwned::to_owned)
-                .collect_vec(),
-            ),
+            shares: (match axis {
+                Axis::Row => eds.square.0.iter_row(idx),
+                Axis::Col => eds.square.0.iter_col(idx),
+            })
+            .map(ToOwned::to_owned)
+            .collect_vec(),
         }
     }
 }
 
-impl<const SHARE_SIZE: usize> std::fmt::Display for ByzantineDataError<SHARE_SIZE> {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "byzantine data detected @ {} {}", self.axis, self.idx)
+impl TooManyErasures {
+    fn new_from_missing_map(missing_map: &MissingMap) -> Self {
+        Self {
+            missing: missing_map.flat_collect(),
+        }
     }
 }
 
-impl<const SHARE_SIZE: usize> std::error::Error for ByzantineDataError<SHARE_SIZE> {}
-
 /// Computes the root of the Merkle tree with the leaves as shares in the square.
-fn compute_root<'a, const SHARE_SIZE: usize>(
-    square: &Square<SHARE_SIZE>,
+fn compute_root<'a, Sz: ArrayLength>(
+    square: &Square<Sz>,
     axis: Axis,
     idx: usize,
 ) -> anyhow::Result<MerkleRoot> {
@@ -90,29 +74,44 @@ fn compute_root<'a, const SHARE_SIZE: usize>(
         .ok_or(anyhow!("unable to calculate root for {axis} {idx}"))
 }
 
-impl<const SHARE_SIZE: usize> DataSquare<SHARE_SIZE> {
-    /// Constructs a `DataSquare` from a flat slice containing `Share`s.
+impl<Sz: NonZeroMultipleOf64> DataSquare<Sz> {
+    /// Constructs a new `DataSquare` from a flat slice containing `Share`s.
     ///
-    /// Returns `Err(_)` if the length of the input is not a perfect square.
-    pub fn new(data: &[Share<SHARE_SIZE>]) -> anyhow::Result<Self> {
-        let width = sqrt(data.len());
+    /// Pads the square if the number of shares is not a perfect square.
+    pub fn new_pad(data: &[Share<Sz>]) -> Self {
+        let width = sqrt_ceil(data.len());
 
-        ensure!(
-            width * width == data.len(),
-            "data length must be a perfect square, received {}",
-            data.len()
-        );
+        let ga = GenericArray::<u8, Sz>::default();
 
-        let mut inner: Square<SHARE_SIZE> = Grid::init(width, width, [0u8; SHARE_SIZE]);
+        let mut inner: Square<Sz> = Grid::init(width, width, ga);
 
         (0..width).for_each(|row_idx| {
             inner
                 .iter_row_mut(row_idx)
                 .enumerate()
-                .for_each(|(i, elt)| *elt = data[row_idx * width + i]);
+                .for_each(|(i, elt)| {
+                    *elt = match data.get(row_idx * width + i) {
+                        Some(share) => share.clone(),
+                        None => new_share(),
+                    }
+                });
         });
 
-        Ok(Self(inner))
+        Self(inner)
+    }
+
+    /// Constructs a `DataSquare` from a flat slice containing `Share`s.
+    ///
+    /// Returns `Err(_)` if the length of the input is not a perfect square.
+    pub fn new(data: &[Share<Sz>]) -> anyhow::Result<Self> {
+        let width = sqrt(data.len());
+
+        invariant!(
+            width * width == data.len(),
+            DataNotSquare { len: data.len() }.into()
+        );
+
+        Ok(Self::new_pad(data))
     }
 
     /// Erasure encodes `self` using `width` rows & columns.
@@ -126,58 +125,20 @@ impl<const SHARE_SIZE: usize> DataSquare<SHARE_SIZE> {
         // They don't depend on each other, so we can do it in the same loop.
         (0..width).try_for_each(|i| {
             {
-                // Annoyingly, the Reed-Solomon library we're using here only supports encoding
-                // byte arrays of size 2 (i.e. a 16 bit integer). This means we need to "compress"
-                // and "decompress" the data during encoding and decoding.
-                //
-                // TODO: figure out a (potentially unsafe) way to do this without so much copying.
-                let mut row_vec = self
+                let mut row_view = self
                     .0
-                    .iter_row(i)
-                    .map(|share| {
-                        share
-                            .iter()
-                            .tuples()
-                            .map(|(b0, b1)| [*b0, *b1])
-                            .collect_vec()
-                    })
-                    .collect_vec();
-
-                rs.encode(&mut row_vec)?;
-
-                self.0
                     .iter_row_mut(i)
-                    .zip(row_vec.iter())
-                    .for_each(|(dest, src)| {
-                        dest.iter_mut().enumerate().for_each(|(i, b)| {
-                            *b = src[i / 2][i % 2];
-                        })
-                    });
+                    .map(|share| as_chunks_mut::<u8, 2>(share))
+                    .collect::<anyhow::Result<Vec<_>>>()?;
+                rs.encode(&mut row_view)?;
             };
-            // TODO: maybe move this to a separate function, the reptition is kinda ugly.
             {
-                let mut col_vec = self
+                let mut col_view = self
                     .0
-                    .iter_col(i)
-                    .map(|share| {
-                        share
-                            .iter()
-                            .tuples()
-                            .map(|(b0, b1)| [*b0, *b1])
-                            .collect_vec()
-                    })
-                    .collect_vec();
-
-                rs.encode(&mut col_vec)?;
-
-                self.0
                     .iter_col_mut(i)
-                    .zip(col_vec.iter())
-                    .for_each(|(dest, src)| {
-                        dest.iter_mut().enumerate().for_each(|(i, b)| {
-                            *b = src[i / 2][i % 2];
-                        })
-                    });
+                    .map(|share| as_chunks_mut::<u8, 2>(share))
+                    .collect::<anyhow::Result<Vec<_>>>()?;
+                rs.encode(&mut col_view)?;
             };
             Ok::<(), anyhow::Error>(())
         })?;
@@ -188,26 +149,12 @@ impl<const SHARE_SIZE: usize> DataSquare<SHARE_SIZE> {
         // NOTE: this should be equivalent to encoding the columns of the row encoding
         // of the original data (this is checked when not in release mode).
         (width..width * 2).try_for_each(|i| {
-            let mut row_vec = self
+            let mut row_view = self
                 .0
-                .iter_row(i)
-                .map(|share| {
-                    share
-                        .iter()
-                        .tuples()
-                        .map(|(b0, b1)| [*b0, *b1])
-                        .collect_vec()
-                })
-                .collect_vec();
-            rs.encode(&mut row_vec)?;
-            self.0
                 .iter_row_mut(i)
-                .zip(row_vec.iter())
-                .for_each(|(dest, src)| {
-                    dest.iter_mut().enumerate().for_each(|(i, b)| {
-                        *b = src[i / 2][i % 2];
-                    })
-                });
+                .map(|share| as_chunks_mut::<u8, 2>(share))
+                .collect::<anyhow::Result<Vec<_>>>()?;
+            rs.encode(&mut row_view)?;
             Ok::<(), anyhow::Error>(())
         })?;
 
@@ -215,26 +162,21 @@ impl<const SHARE_SIZE: usize> DataSquare<SHARE_SIZE> {
         // columns of Q1.
         #[cfg(debug_assertions)]
         (width..width * 2).try_for_each(|i| {
-            let mut col_vec = self
+            let col_view = self
                 .0
                 .iter_col(i)
-                .map(|share| {
-                    share
-                        .iter()
-                        .tuples()
-                        .map(|(b0, b1)| [*b0, *b1])
-                        .collect_vec()
-                })
-                .collect_vec();
-            rs.encode(&mut col_vec)?;
-            self.0
-                .iter_col_mut(i)
-                .zip(col_vec.iter())
-                .for_each(|(dest, src)| {
-                    dest.iter_mut().enumerate().for_each(|(i, b)| {
-                        assert_eq!(*b, src[i / 2][i % 2]);
-                    })
-                });
+                .map(|share| as_chunks::<u8, 2>(share))
+                .collect::<anyhow::Result<Vec<_>>>()?;
+
+            let mut parity = vec![new_share::<Sz>(); width];
+            let mut parity_view = parity
+                .iter_mut()
+                .map(|x| as_chunks_mut::<u8, 2>(x))
+                .collect::<anyhow::Result<Vec<_>>>()?;
+
+            rs.encode_sep(&col_view[..width], &mut parity_view[..])?;
+
+            assert_eq!(&col_view[width..], &parity_view[..]);
             Ok::<(), anyhow::Error>(())
         })?;
 
@@ -255,10 +197,10 @@ impl<const SHARE_SIZE: usize> DataSquare<SHARE_SIZE> {
     /// Extends self using a 2D Reed-Solomon encoding.
     ///
     /// The resulting backing grid has dimension `2 * width` x `2 * width`.
-    pub fn extend(mut self) -> anyhow::Result<ExtendedDataSquare<SHARE_SIZE>> {
+    pub fn extend(mut self) -> anyhow::Result<ExtendedDataSquare<Sz>> {
         let original_width = self.0.cols();
-        (0..self.0.cols()).for_each(|_| self.0.push_col(vec![[0u8; SHARE_SIZE]; self.0.rows()]));
-        (0..self.0.rows()).for_each(|_| self.0.push_row(vec![[0u8; SHARE_SIZE]; self.0.cols()]));
+        (0..self.0.cols()).for_each(|_| self.0.push_col(vec![new_share(); self.0.rows()]));
+        (0..self.0.rows()).for_each(|_| self.0.push_row(vec![new_share(); self.0.cols()]));
         self.erasure_encode(original_width)?;
         let row_roots = self.compute_roots(Axis::Row)?;
         let col_roots = self.compute_roots(Axis::Col)?;
@@ -288,7 +230,7 @@ impl Default for RepairStep {
 }
 
 impl RepairStep {
-    fn combine(&self, other: &Self) -> Self {
+    fn join(&self, other: &Self) -> Self {
         Self {
             solved: self.solved && other.solved,
             progress_made: self.progress_made || other.progress_made,
@@ -296,7 +238,7 @@ impl RepairStep {
     }
 }
 
-impl<const SHARE_SIZE: usize> ExtendedDataSquare<SHARE_SIZE> {
+impl<Sz: NonZeroMultipleOf64> ExtendedDataSquare<Sz> {
     /// TODO: verify encoding
 
     /// Before executing a repair, check if the slice is valid.
@@ -306,7 +248,7 @@ impl<const SHARE_SIZE: usize> ExtendedDataSquare<SHARE_SIZE> {
         &self,
         axis: Axis,
         idx: usize,
-        missing: &BisetMap<usize, usize>,
+        missing: &MissingMap,
     ) -> anyhow::Result<()> {
         let has_missing = match axis {
             Axis::Row => missing.key_exists(&idx),
@@ -319,10 +261,10 @@ impl<const SHARE_SIZE: usize> ExtendedDataSquare<SHARE_SIZE> {
             };
             let expected_root = roots
                 .get(idx)
-                .ok_or(ByzantineDataError::new_with_shares(self, axis, idx))?;
+                .ok_or_else(|| ByzantineData::new_from_eds(self, axis, idx))?;
             let calculated_root = compute_root(&self.square.0, axis, idx)?;
             if expected_root != &calculated_root {
-                Err(ByzantineDataError::new_with_shares(self, axis, idx).into())
+                Err(ByzantineData::new_from_eds(self, axis, idx).into())
             } else {
                 Ok(())
             }
@@ -332,7 +274,7 @@ impl<const SHARE_SIZE: usize> ExtendedDataSquare<SHARE_SIZE> {
     }
 
     /// Before executing a repair, check if `self` contains any known Byzantine data.
-    fn repair_preflight(&self, missing: &BisetMap<usize, usize>) -> anyhow::Result<()> {
+    fn repair_preflight(&self, missing: &MissingMap) -> anyhow::Result<()> {
         (0..self.original_width * 2)
             .try_for_each(|i| self.repair_preflight_slice(Axis::Row, i, &missing))?;
         (0..self.original_width * 2)
@@ -345,7 +287,7 @@ impl<const SHARE_SIZE: usize> ExtendedDataSquare<SHARE_SIZE> {
         &mut self,
         axis: Axis,
         idx: usize,
-        missing: &BisetMap<usize, usize>,
+        missing: &MissingMap,
     ) -> anyhow::Result<RepairStep> {
         let rs = ReedSolomon::new(self.original_width, self.original_width)?;
 
@@ -363,22 +305,22 @@ impl<const SHARE_SIZE: usize> ExtendedDataSquare<SHARE_SIZE> {
         };
 
         if !missing_indices.is_empty() {
+            // Copy the shares into a new array where `shares[i] = Some(_)` if the element is
+            // present and `None` if it is not.
             let mut shares = iter
                 .enumerate()
                 .map(|(jdx, share)| {
                     if missing_indices.contains(&jdx) {
-                        None
+                        Ok(None)
                     } else {
-                        let temp = share
-                            .iter()
-                            .tuples()
-                            .map(|(b0, b1)| [*b0, *b1])
-                            .collect_vec();
-                        Some(temp)
+                        Ok(Some(
+                            as_chunks::<u8, 2>(share)?.iter().cloned().collect_vec(),
+                        ))
                     }
                 })
-                .collect_vec();
+                .collect::<anyhow::Result<Vec<_>>>()?;
 
+            // We "ignore" failures here because we want to keep trying to solve.
             if let Err(_) = rs.reconstruct(&mut shares) {
                 return Ok(RepairStep {
                     solved: false,
@@ -386,24 +328,15 @@ impl<const SHARE_SIZE: usize> ExtendedDataSquare<SHARE_SIZE> {
                 });
             };
 
-            // TODO: so much copying...
-            //
-            // Ideally we use a different library for the RS encoding
             let decompressed = shares
                 .iter()
-                .map(|share| {
-                    let reconstructed = share
-                        .as_ref()
-                        .ok_or(anyhow!("reconstruction succeeded but got None."))?;
-
-                    let mut share = [0u8; SHARE_SIZE];
-                    share.iter_mut().enumerate().for_each(|(i, dest)| {
-                        *dest = reconstructed[i / 2][i % 2];
-                    });
-
-                    Ok::<Share<SHARE_SIZE>, anyhow::Error>(share)
+                .map(|reconstructed_opt| {
+                    let reconstructed = reconstructed_opt.as_ref().unwrap();
+                    let mut share: Share<Sz> = new_share();
+                    share.clone_from_slice(as_flat(&reconstructed)?);
+                    Ok(share)
                 })
-                .collect::<anyhow::Result<Vec<Share<SHARE_SIZE>>>>()?;
+                .collect::<anyhow::Result<Vec<Share<Sz>>>>()?;
 
             let calculated_root = {
                 let leaves = decompressed
@@ -412,11 +345,11 @@ impl<const SHARE_SIZE: usize> ExtendedDataSquare<SHARE_SIZE> {
                     .collect_vec();
                 let tree = MerkleTree::<Sha256>::from_leaves(&leaves);
                 tree.root()
-                    .ok_or(ByzantineDataError::new_with_shares(self, axis, idx))
+                    .ok_or_else(|| ByzantineData::new_from_eds(self, axis, idx))
             }?;
 
             if calculated_root != expected_root {
-                return Err(ByzantineDataError::new_with_shares(self, axis, idx).into());
+                return Err(ByzantineData::new_from_eds(self, axis, idx).into());
             }
 
             missing_indices.iter().try_for_each(|jdx| {
@@ -426,20 +359,82 @@ impl<const SHARE_SIZE: usize> ExtendedDataSquare<SHARE_SIZE> {
                 };
 
                 let share = unsafe { self.square.0.get_unchecked_mut(row_idx, col_idx) };
-                *share = decompressed[*jdx];
+                *share = decompressed[*jdx].clone();
 
                 Ok::<(), anyhow::Error>(())
             })?;
 
-            missing_indices.iter().for_each(|jdx| {
-                // TODO: check orthogonal axis root if slice is now completed
-                let (row_idx, col_idx) = match axis {
-                    Axis::Row => (idx, *jdx),
-                    Axis::Col => (*jdx, idx),
+            missing_indices.iter().try_for_each(|jdx| {
+                // Get the missing status for the orthogonal slice of the index we just updated.
+                //
+                // If there are no more missing shares in the slice, check the slice against the
+                // expected root and the RS encoding.
+                let (row_idx, col_idx, ortho_missing, ortho_iter, ortho_expected_root) = match axis
+                {
+                    Axis::Row => (
+                        idx,
+                        *jdx,
+                        missing.rev_get(jdx),
+                        self.square.0.iter_col(*jdx),
+                        self.col_roots[*jdx],
+                    ),
+                    Axis::Col => (
+                        *jdx,
+                        idx,
+                        missing.get(jdx),
+                        self.square.0.iter_row(*jdx),
+                        self.row_roots[*jdx],
+                    ),
                 };
 
-                missing.remove(&row_idx, &col_idx)
-            });
+                // The orthogonal slice is complete if the only missing share is the current one
+                //
+                // We already upated it in the square, but we haven't removed it from the map of
+                // missing indices.
+                let ortho_complete = ortho_missing.len() == 1 && ortho_missing[0] == *jdx;
+
+                if ortho_complete {
+                    let ortho_calculated_root = {
+                        // This clone just clones the references, not the underlying data.
+                        let leaves = ortho_iter
+                            .clone()
+                            .map(|share| Sha256::hash(share))
+                            .collect_vec();
+                        let tree = MerkleTree::<Sha256>::from_leaves(&leaves);
+                        tree.root()
+                            .ok_or_else(|| ByzantineData::new_from_eds(self, axis.ortho(), *jdx))
+                    }?;
+
+                    // Invariant: the computed Merkle root of the slice should match the "known" one.
+                    invariant!(
+                        ortho_expected_root == ortho_calculated_root,
+                        ByzantineData::new_from_eds(self, axis.ortho(), *jdx).into()
+                    );
+
+                    let shares_view = ortho_iter
+                        .clone()
+                        .map(|x| as_chunks(x))
+                        .collect::<anyhow::Result<Vec<&[[u8; 2]]>>>()?;
+
+                    let mut parity = vec![new_share::<Sz>(); self.original_width];
+
+                    let mut parity_view = parity
+                        .iter_mut()
+                        .map(|x| as_chunks_mut(x))
+                        .collect::<anyhow::Result<Vec<&mut [[u8; 2]]>>>()?;
+                    rs.encode_sep(&shares_view[..self.original_width], &mut parity_view)?;
+
+                    // Invariant: the parity data of the shares should match the recomputed parity.
+                    invariant!(
+                        &shares_view[..self.original_width] == &parity_view[..],
+                        ByzantineData::new_from_eds(self, axis.ortho(), *jdx).into()
+                    )
+                }
+
+                missing.remove(&row_idx, &col_idx);
+
+                Ok::<(), anyhow::Error>(())
+            })?;
 
             Ok(RepairStep {
                 solved: true,
@@ -456,24 +451,22 @@ impl<const SHARE_SIZE: usize> ExtendedDataSquare<SHARE_SIZE> {
     /// Attempt to solve the EDS by reaching a fixed point.
     ///
     /// Returns `Err(_)` if Byzantine data is detected or no progress can be made.
-    fn solve(&mut self, missing: &BisetMap<usize, usize>) -> anyhow::Result<()> {
+    fn solve(&mut self, missing: &MissingMap) -> anyhow::Result<()> {
         loop {
             let repair_step: RepairStep =
                 (0..self.original_width * 2).try_fold(RepairStep::default(), |acc, i| {
                     let row_repair_step = self.solve_slice(Axis::Row, i, missing)?;
                     let col_repair_step = self.solve_slice(Axis::Col, i, missing)?;
 
-                    Ok::<_, anyhow::Error>(acc.combine(&row_repair_step).combine(&col_repair_step))
+                    Ok::<_, anyhow::Error>(acc.join(&row_repair_step).join(&col_repair_step))
                 })?;
 
             if repair_step.solved {
-                break;
+                return Ok(());
             } else if !repair_step.progress_made {
-                return Err(anyhow!("no progress made in solution"));
+                return Err(TooManyErasures::new_from_missing_map(missing).into());
             }
         }
-
-        Ok(())
     }
 
     /// Repair the EDS, assuming the indices in `missing` are erased/corrupted.
@@ -492,42 +485,45 @@ impl<const SHARE_SIZE: usize> ExtendedDataSquare<SHARE_SIZE> {
 #[cfg(test)]
 mod test {
     use super::*;
-    use grid::grid;
+    use generic_array::arr;
+    use typenum::U256;
 
-    #[test]
-    fn two_by_two() {
-        let data = [[0u8, 1], [2, 3], [4, 5], [6, 7]];
-        let ds = DataSquare::new(&data).unwrap();
-        assert_eq!(
-            ds.0,
-            grid![
-                [[0u8, 1], [2, 3]]
-                [[4, 5], [6, 7]]
-            ]
-        );
+    fn make_ds<const L: usize>() -> DataSquare<U256> {
+        let mut i = 0;
+        let arr: [Share<_>; L] = [(); L].map(|()| {
+            i = i + 1;
+            arr![i; 256]
+        });
+        DataSquare::new_pad(&arr)
     }
 
     #[test]
     fn extension() {
-        let arr: [[u8; 64]; 4] = (0..4)
-            .map(|i| [i + 1; 64])
-            .collect::<Vec<_>>()
-            .try_into()
-            .unwrap();
-        let ds = DataSquare::new(&arr).unwrap();
+        let ds = make_ds::<4>();
         let _eds = ds.extend(); // The debug assert should fail if this test doesn't pass
     }
 
     #[test]
+    fn new_pad_pads() {
+        let ds = make_ds::<3>();
+        let empty_share = new_share::<U256>();
+        assert_eq!(ds.0[(1, 1)], empty_share)
+    }
+
+    #[test]
     fn extension_repair_max() {
-        let arr: [[u8; 64]; 4] = (0..4)
-            .map(|i| [i + 1; 64])
-            .collect::<Vec<_>>()
-            .try_into()
-            .unwrap();
-        let ds = DataSquare::new(&arr).unwrap();
+        let ds = make_ds::<4>();
         let eds0 = ds.extend().unwrap();
         let mut eds1 = eds0.clone();
+        // -----------------
+        // | x |   | x | x |
+        // |---|---|---|---|
+        // | x | x | x | x |
+        // |---|---|---|---|
+        // | x | x | x |   |
+        // |---|---|---|---|
+        // | x |   |   | x |
+        // -----------------
         let missing = [
             (0, 0),
             (0, 2),
@@ -546,7 +542,7 @@ mod test {
         // Zero out the shares that we are "missing"
         for (row_idx, col_idx) in missing {
             let share = unsafe { eds1.square.0.get_unchecked_mut(row_idx, col_idx) };
-            *share = [0u8; 64]
+            *share = arr![0u8; 256]
         }
 
         eds1.repair(&missing).unwrap();
@@ -555,44 +551,82 @@ mod test {
     }
 
     #[test]
+    fn extension_repair_too_many_erasures() {
+        let ds = make_ds::<4>();
+        let eds0 = ds.extend().unwrap();
+        let mut eds1 = eds0.clone();
+        // -----------------
+        // | x |   | x | x |
+        // |---|---|---|---|
+        // | x | x | x | x |
+        // |---|---|---|---|
+        // | x | x | x |   |
+        // |---|---|---|---|
+        // | x | x |   | x |
+        // -----------------
+        // (no row has >=2 known shares)
+        let missing = [
+            (0, 0),
+            (0, 2),
+            (0, 3),
+            (1, 0),
+            (1, 1),
+            (1, 2),
+            (1, 3),
+            (2, 0),
+            (2, 1),
+            (2, 2),
+            (3, 0),
+            (3, 1),
+            (3, 3),
+        ];
+
+        // Zero out the shares that we are "missing"
+        for (row_idx, col_idx) in missing {
+            let share = unsafe { eds1.square.0.get_unchecked_mut(row_idx, col_idx) };
+            *share = new_share()
+        }
+
+        let err = eds1.repair(&missing).unwrap_err();
+        assert!(err.is::<TooManyErasures>())
+    }
+
+    #[test]
     fn extension_repair_preflight_incorrect_root() {
-        let arr: [[u8; 64]; 4] = (0..4)
-            .map(|i| [i + 1; 64])
-            .collect::<Vec<_>>()
-            .try_into()
-            .unwrap();
-        let ds = DataSquare::new(&arr).unwrap();
+        let ds = make_ds::<4>();
         let mut eds = ds.extend().unwrap();
         eds.row_roots[0][0] = !eds.row_roots[0][0];
         let err = eds.repair(&[]).unwrap_err();
-        assert!(err.is::<ByzantineDataError<64>>())
+        assert!(err.is::<ByzantineData<U256>>())
     }
 
     #[test]
     fn extension_repair_incorrect_root() {
-        let arr: [[u8; 64]; 4] = (0..4)
-            .map(|i| [i + 1; 64])
-            .collect::<Vec<_>>()
-            .try_into()
-            .unwrap();
-        let ds = DataSquare::new(&arr).unwrap();
+        let ds = make_ds::<4>();
         let mut eds = ds.extend().unwrap();
         eds.row_roots[0][0] = !eds.row_roots[0][0];
         let err = eds.repair(&[(0, 0)]).unwrap_err();
-        assert!(err.is::<ByzantineDataError<64>>())
+        assert!(err.is::<ByzantineData<U256>>())
     }
 
     #[test]
     fn extension_repair_incorrect_ortho_root() {
-        let arr: [[u8; 64]; 4] = (0..4)
-            .map(|i| [i + 1; 64])
-            .collect::<Vec<_>>()
-            .try_into()
-            .unwrap();
-        let ds = DataSquare::new(&arr).unwrap();
+        let ds = make_ds::<4>();
         let mut eds = ds.extend().unwrap();
         eds.col_roots[0][0] = !eds.col_roots[0][0];
         let err = eds.repair(&[(0, 0)]).unwrap_err();
-        assert!(err.is::<ByzantineDataError<64>>())
+        assert!(err.is::<ByzantineData<U256>>())
+    }
+
+    #[test]
+    fn extension_repair_incorrect_ortho_encoding() {
+        let ds = make_ds::<4>();
+        let mut eds = ds.extend().unwrap();
+        eds.square.0[(1, 0)] = new_share();
+
+        eds.col_roots[0] = compute_root(&eds.square.0, Axis::Col, 0).unwrap();
+
+        let err = eds.repair(&[(0, 0)]).unwrap_err();
+        assert!(err.is::<ByzantineData<U256>>())
     }
 }

@@ -8,6 +8,7 @@ edition = "2021"
 [dependencies]
 anyhow = "1.0.86"
 bisetmap = "0.1.6"
+generic-array = "1.1.0"
 grid = "0.14.0"
 itertools = "0.13.0"
 num = "0.4.3"
@@ -15,6 +16,7 @@ rand = "0.8.5"
 reed-solomon-erasure = { version = "6.0.0", features = ["simd-accel"] }
 reed-solomon-simd = "2.2.2"
 rs_merkle = "1.4.2"
+typenum = "1.17.0"
 
 [dev-dependencies]
 quickcheck = "1.0.3"

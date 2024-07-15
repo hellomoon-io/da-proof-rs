@@ -1,6 +1,6 @@
 use crate::bisetmap::BisetMap;
+use crate::common::MerkleProof;
 use crate::util::{as_chunks, as_chunks_mut, as_flat, invariant, sqrt_ceil};
-use anyhow::anyhow;
 use borsh::{BorshDeserialize, BorshSerialize};
 use generic_array::{ArrayLength, GenericArray};
 use grid::Grid;
@@ -11,7 +11,10 @@ use rs_merkle::algorithms::Sha256;
 use rs_merkle::{Hasher, MerkleTree};
 
 use crate::common::{new_share, Axis, MerkleRoot, NonZeroMultipleOf64, Share, Square};
-use crate::error::{ByzantineData, DataNotSquare, ShareSizeDoesNotMatch, TooManyErasures};
+use crate::error::{
+    ByzantineData, DataNotSquare, ShareSizeDoesNotMatch, TooManyErasures,
+    UnableToConstructMerkleRoot,
+};
 
 /// A "square" of data aligned into `Share`s.
 ///
@@ -126,7 +129,7 @@ impl TooManyErasures {
 }
 
 /// Computes the root of the Merkle tree with the leaves as shares in the square.
-fn compute_root<'a, Sz: ArrayLength>(
+fn compute_root<Sz: ArrayLength>(
     square: &Square<Sz>,
     axis: Axis,
     idx: usize,
@@ -140,7 +143,22 @@ fn compute_root<'a, Sz: ArrayLength>(
     let tree = MerkleTree::<Sha256>::from_leaves(&leaves);
 
     tree.root()
-        .ok_or(anyhow!("unable to calculate root for {axis} {idx}"))
+        .ok_or(UnableToConstructMerkleRoot::Axis(axis, idx).into())
+}
+
+fn compute_proof<Sz: ArrayLength>(
+    square: &Square<Sz>,
+    axis: Axis,
+    row: usize,
+    col: usize,
+) -> MerkleProof {
+    let (iter, ortho_idx) = match axis {
+        Axis::Row => (square.iter_row(row), col),
+        Axis::Col => (square.iter_col(col), row),
+    };
+    let leaves: Vec<MerkleRoot> = iter.map(|share| Sha256::hash(share)).collect();
+    let tree = MerkleTree::<Sha256>::from_leaves(&leaves);
+    tree.proof(&[ortho_idx]).into()
 }
 
 impl<Sz: NonZeroMultipleOf64> DataSquare<Sz> {
@@ -551,12 +569,61 @@ impl<Sz: NonZeroMultipleOf64> ExtendedDataSquare<Sz> {
         self.solve(&mut missing_map)?;
         Ok(())
     }
+
+    pub fn data_root(&self) -> anyhow::Result<MerkleRoot> {
+        let leaves = self
+            .row_roots
+            .iter()
+            .chain(self.col_roots.iter())
+            .map(ToOwned::to_owned)
+            .collect_vec();
+
+        let tree = MerkleTree::<Sha256>::from_leaves(&leaves[..]);
+        tree.root().ok_or(UnableToConstructMerkleRoot::Data.into())
+    }
+
+    pub fn merkle_proof_share(&self, axis: Axis, row: usize, col: usize) -> MerkleProof {
+        compute_proof(&self.square.0, axis, row, col)
+    }
+
+    pub fn merkle_proof_axis(&self, axis: Axis, idx: usize) -> MerkleProof {
+        let leaves = self
+            .row_roots
+            .iter()
+            .chain(self.col_roots.iter())
+            .map(ToOwned::to_owned)
+            .collect_vec();
+        let tree = MerkleTree::<Sha256>::from_leaves(&leaves[..]);
+        let idx = match axis {
+            Axis::Row => idx,
+            Axis::Col => self.original_width * 2 + 1,
+        };
+        tree.proof(&[idx]).into()
+    }
+
+    pub fn verify_merkle_proof_share(
+        &self,
+        axis: Axis,
+        row: usize,
+        col: usize,
+        merkle_proof: &MerkleProof,
+    ) -> bool {
+        let (root, idx) = match axis {
+            Axis::Row => (self.row_roots[row], row),
+            Axis::Col => (self.col_roots[col], col),
+        };
+
+        merkle_proof.0.verify(
+            root,
+            &[idx],
+            &[Sha256::hash(&self.square.0[(row, col)])],
+            self.original_width * 2,
+        )
+    }
 }
 
 #[cfg(test)]
 mod test {
-    use std::error::Error;
-
     use super::*;
     use borsh::{BorshDeserialize, BorshSerialize};
     use generic_array::arr;
@@ -737,5 +804,21 @@ mod test {
         eds.serialize(&mut buf).unwrap();
         let desered = ExtendedDataSquare::<U256>::deserialize(&mut &buf[..]).unwrap();
         assert_eq!(eds, desered);
+    }
+
+    #[test]
+    fn merkle_proof_verification_ok() {
+        let ds = make_ds::<4>();
+        let eds = ds.extend().unwrap();
+        let proof = eds.merkle_proof_share(Axis::Row, 1, 1);
+        assert!(eds.verify_merkle_proof_share(Axis::Row, 1, 1, &proof));
+    }
+
+    #[test]
+    fn merkle_proof_verification_err() {
+        let ds = make_ds::<4>();
+        let eds = ds.extend().unwrap();
+        let proof = eds.merkle_proof_share(Axis::Row, 1, 1);
+        assert!(!eds.verify_merkle_proof_share(Axis::Row, 1, 2, &proof));
     }
 }

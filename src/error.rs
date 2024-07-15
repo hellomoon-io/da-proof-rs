@@ -94,3 +94,22 @@ impl std::fmt::Display for ShareSizeDoesNotMatch {
 }
 
 impl std::error::Error for ShareSizeDoesNotMatch {}
+
+/// An error that is returned when unable to compute a Merkle root
+#[derive(Debug)]
+pub enum UnableToConstructMerkleRoot {
+    Axis(Axis, usize),
+    Data,
+}
+
+impl std::fmt::Display for UnableToConstructMerkleRoot {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "unable to construct merkle root ");
+        match self {
+            UnableToConstructMerkleRoot::Axis(axis, col) => write!(f, "for {axis}, {col}"),
+            UnableToConstructMerkleRoot::Data => write!(f, "for data"),
+        }
+    }
+}
+
+impl std::error::Error for UnableToConstructMerkleRoot {}

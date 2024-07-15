@@ -75,3 +75,22 @@ impl std::fmt::Display for InvalidChunkSize {
 }
 
 impl std::error::Error for InvalidChunkSize {}
+
+/// An error that is returned when the user deserializes a share with an incorrect size.
+#[derive(Debug)]
+pub struct ShareSizeDoesNotMatch {
+    pub actual: u64,
+    pub expected: u64,
+}
+
+impl std::fmt::Display for ShareSizeDoesNotMatch {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "expected a share size of {}, got {}",
+            self.expected, self.actual
+        )
+    }
+}
+
+impl std::error::Error for ShareSizeDoesNotMatch {}

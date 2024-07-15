@@ -1,6 +1,7 @@
+use crate::bisetmap::BisetMap;
 use crate::util::{as_chunks, as_chunks_mut, as_flat, invariant, sqrt_ceil};
 use anyhow::anyhow;
-use bisetmap::BisetMap;
+use borsh::{BorshDeserialize, BorshSerialize};
 use generic_array::{ArrayLength, GenericArray};
 use grid::Grid;
 use itertools::Itertools;
@@ -10,23 +11,91 @@ use rs_merkle::algorithms::Sha256;
 use rs_merkle::{Hasher, MerkleTree};
 
 use crate::common::{new_share, Axis, MerkleRoot, NonZeroMultipleOf64, Share, Square};
-use crate::error::{ByzantineData, DataNotSquare, TooManyErasures};
+use crate::error::{ByzantineData, DataNotSquare, ShareSizeDoesNotMatch, TooManyErasures};
 
 /// A "square" of data aligned into `Share`s.
 ///
 /// *Invariant*: the data is square, i.e. the grid is equally as wide as it is high.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct DataSquare<Sz: NonZeroMultipleOf64>(Square<Sz>);
+
+impl<Sz: NonZeroMultipleOf64> BorshSerialize for DataSquare<Sz> {
+    fn serialize<W: std::io::Write>(&self, writer: &mut W) -> std::io::Result<()> {
+        // Serialize the size of the shares
+        Sz::U64.serialize(writer)?;
+        // Serialize the width of the square
+        (self.0.rows() as u64).serialize(writer)?;
+        self.0.iter_rows().try_for_each(|mut row| {
+            row.try_for_each(|elt| elt.iter().try_for_each(|byte| byte.serialize(writer)))
+        })
+    }
+}
+
+impl<Sz: NonZeroMultipleOf64> BorshDeserialize for DataSquare<Sz> {
+    fn deserialize_reader<R: std::io::Read>(reader: &mut R) -> std::io::Result<Self> {
+        let sz = u64::deserialize_reader(reader)?;
+        invariant!(
+            sz == Sz::U64,
+            std::io::Error::new(
+                std::io::ErrorKind::Other,
+                ShareSizeDoesNotMatch {
+                    actual: sz,
+                    expected: Sz::U64
+                }
+            )
+        );
+        let width = u64::deserialize_reader(reader)?;
+        let mut grid = Grid::new(width as usize, width as usize);
+        (0..width).try_for_each(|row| {
+            (0..width).try_for_each(|col| {
+                let mut share = GenericArray::<u8, Sz>::default();
+                (0..Sz::USIZE).try_for_each(|i| {
+                    share[i] = u8::deserialize_reader(reader)?;
+                    Ok::<(), std::io::Error>(())
+                })?;
+
+                grid[(row as usize, col as usize)] = share;
+
+                Ok::<(), std::io::Error>(())
+            })
+        })?;
+        Ok(Self(grid))
+    }
+}
 
 /// An extended "square" of data.
 ///
 /// This includes the erasure encoded data derived from the original `DataSquare`.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct ExtendedDataSquare<Sz: NonZeroMultipleOf64> {
     original_width: usize,
     square: DataSquare<Sz>,
     row_roots: Vec<MerkleRoot>,
     col_roots: Vec<MerkleRoot>,
+}
+
+impl<Sz: NonZeroMultipleOf64> BorshSerialize for ExtendedDataSquare<Sz> {
+    fn serialize<W: std::io::Write>(&self, writer: &mut W) -> std::io::Result<()> {
+        (self.original_width as u64).serialize(writer)?;
+        self.square.serialize(writer)?;
+        self.row_roots.serialize(writer)?;
+        self.col_roots.serialize(writer)
+    }
+}
+
+impl<Sz: NonZeroMultipleOf64> BorshDeserialize for ExtendedDataSquare<Sz> {
+    fn deserialize_reader<R: std::io::Read>(reader: &mut R) -> std::io::Result<Self> {
+        let original_width = u64::deserialize_reader(reader)?;
+        let square = DataSquare::<Sz>::deserialize_reader(reader)?;
+        let row_roots = Vec::<MerkleRoot>::deserialize_reader(reader)?;
+        let col_roots = Vec::<MerkleRoot>::deserialize_reader(reader)?;
+        Ok(Self {
+            original_width: original_width as usize,
+            square,
+            row_roots,
+            col_roots,
+        })
+    }
 }
 
 /// A two way map of missing shares in an EDS
@@ -51,7 +120,7 @@ impl<Sz: NonZeroMultipleOf64> ByzantineData<Sz> {
 impl TooManyErasures {
     fn new_from_missing_map(missing_map: &MissingMap) -> Self {
         Self {
-            missing: missing_map.flat_collect(),
+            missing: missing_map.flat_iter().collect_vec(),
         }
     }
 }
@@ -251,8 +320,8 @@ impl<Sz: NonZeroMultipleOf64> ExtendedDataSquare<Sz> {
         missing: &MissingMap,
     ) -> anyhow::Result<()> {
         let has_missing = match axis {
-            Axis::Row => missing.key_exists(&idx),
-            Axis::Col => missing.value_exists(&idx),
+            Axis::Row => missing.exists_left(&idx),
+            Axis::Col => missing.exists_right(&idx),
         };
         if !has_missing {
             let roots = match axis {
@@ -287,24 +356,24 @@ impl<Sz: NonZeroMultipleOf64> ExtendedDataSquare<Sz> {
         &mut self,
         axis: Axis,
         idx: usize,
-        missing: &MissingMap,
+        missing: &mut MissingMap,
     ) -> anyhow::Result<RepairStep> {
         let rs = ReedSolomon::new(self.original_width, self.original_width)?;
 
-        let (missing_indices, iter, expected_root) = match axis {
+        let (missing_indices_opt, iter, expected_root) = match axis {
             Axis::Row => (
-                missing.get(&idx),
+                missing.get_left(&idx).cloned(),
                 self.square.0.iter_row(idx),
                 self.row_roots[idx],
             ),
             Axis::Col => (
-                missing.rev_get(&idx),
+                missing.get_right(&idx).cloned(),
                 self.square.0.iter_col(idx),
                 self.col_roots[idx],
             ),
         };
 
-        if !missing_indices.is_empty() {
+        if let Some(missing_indices) = missing_indices_opt {
             // Copy the shares into a new array where `shares[i] = Some(_)` if the element is
             // present and `None` if it is not.
             let mut shares = iter
@@ -369,29 +438,31 @@ impl<Sz: NonZeroMultipleOf64> ExtendedDataSquare<Sz> {
                 //
                 // If there are no more missing shares in the slice, check the slice against the
                 // expected root and the RS encoding.
-                let (row_idx, col_idx, ortho_missing, ortho_iter, ortho_expected_root) = match axis
-                {
-                    Axis::Row => (
-                        idx,
-                        *jdx,
-                        missing.rev_get(jdx),
-                        self.square.0.iter_col(*jdx),
-                        self.col_roots[*jdx],
-                    ),
-                    Axis::Col => (
-                        *jdx,
-                        idx,
-                        missing.get(jdx),
-                        self.square.0.iter_row(*jdx),
-                        self.row_roots[*jdx],
-                    ),
-                };
+                let (row_idx, col_idx, ortho_missing_opt, ortho_iter, ortho_expected_root) =
+                    match axis {
+                        Axis::Row => (
+                            idx,
+                            *jdx,
+                            missing.get_right(jdx),
+                            self.square.0.iter_col(*jdx),
+                            self.col_roots[*jdx],
+                        ),
+                        Axis::Col => (
+                            *jdx,
+                            idx,
+                            missing.get_left(jdx),
+                            self.square.0.iter_row(*jdx),
+                            self.row_roots[*jdx],
+                        ),
+                    };
 
                 // The orthogonal slice is complete if the only missing share is the current one
                 //
                 // We already upated it in the square, but we haven't removed it from the map of
                 // missing indices.
-                let ortho_complete = ortho_missing.len() == 1 && ortho_missing[0] == *jdx;
+                let ortho_complete = ortho_missing_opt.map_or(false, |ortho_missing| {
+                    ortho_missing.len() == 1 && ortho_missing.contains(jdx)
+                });
 
                 if ortho_complete {
                     let ortho_calculated_root = {
@@ -451,7 +522,7 @@ impl<Sz: NonZeroMultipleOf64> ExtendedDataSquare<Sz> {
     /// Attempt to solve the EDS by reaching a fixed point.
     ///
     /// Returns `Err(_)` if Byzantine data is detected or no progress can be made.
-    fn solve(&mut self, missing: &MissingMap) -> anyhow::Result<()> {
+    fn solve(&mut self, missing: &mut MissingMap) -> anyhow::Result<()> {
         loop {
             let repair_step: RepairStep =
                 (0..self.original_width * 2).try_fold(RepairStep::default(), |acc, i| {
@@ -472,21 +543,24 @@ impl<Sz: NonZeroMultipleOf64> ExtendedDataSquare<Sz> {
     /// Repair the EDS, assuming the indices in `missing` are erased/corrupted.
     pub fn repair(&mut self, missing: &[(usize, usize)]) -> anyhow::Result<()> {
         // Assemble missing maps
-        let missing_map = BisetMap::new();
+        let mut missing_map = BisetMap::new();
         missing.iter().for_each(|(row, col)| {
             missing_map.insert(*row, *col);
         });
         self.repair_preflight(&missing_map)?;
-        self.solve(&missing_map)?;
+        self.solve(&mut missing_map)?;
         Ok(())
     }
 }
 
 #[cfg(test)]
 mod test {
+    use std::error::Error;
+
     use super::*;
+    use borsh::{BorshDeserialize, BorshSerialize};
     use generic_array::arr;
-    use typenum::U256;
+    use typenum::{U128, U256};
 
     fn make_ds<const L: usize>() -> DataSquare<U256> {
         let mut i = 0;
@@ -628,5 +702,40 @@ mod test {
 
         let err = eds.repair(&[(0, 0)]).unwrap_err();
         assert!(err.is::<ByzantineData<U256>>())
+    }
+
+    #[test]
+    fn ds_serialization_deserialization() {
+        let ds = make_ds::<4>();
+        let mut buf = Vec::<u8>::new();
+        ds.serialize(&mut buf).unwrap();
+        let desered = DataSquare::<U256>::deserialize(&mut &buf[..]).unwrap();
+        assert_eq!(ds, desered);
+    }
+
+    #[test]
+    fn ds_deserialize_incorrect_size() {
+        let ds = make_ds::<4>();
+        let mut buf = Vec::<u8>::new();
+        ds.serialize(&mut buf).unwrap();
+        let err = DataSquare::<U128>::deserialize(&mut &buf[..]).unwrap_err();
+        let err = err
+            .get_ref()
+            .unwrap()
+            .downcast_ref::<ShareSizeDoesNotMatch>()
+            .unwrap();
+
+        assert_eq!(err.expected, 128);
+        assert_eq!(err.actual, 256)
+    }
+
+    #[test]
+    fn eds_serialization_deserialization() {
+        let ds = make_ds::<4>();
+        let eds = ds.extend().unwrap();
+        let mut buf = Vec::<u8>::new();
+        eds.serialize(&mut buf).unwrap();
+        let desered = ExtendedDataSquare::<U256>::deserialize(&mut &buf[..]).unwrap();
+        assert_eq!(eds, desered);
     }
 }

@@ -7,7 +7,7 @@ edition = "2021"
 
 [dependencies]
 anyhow = "1.0.86"
-bisetmap = "0.1.6"
+borsh = { version = "1.5.1", features = ["derive"] }
 generic-array = "1.1.0"
 grid = "0.14.0"
 itertools = "0.13.0"

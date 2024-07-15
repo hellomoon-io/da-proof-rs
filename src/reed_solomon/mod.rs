@@ -1,5 +1,3 @@
-use std::env::VarError;
-
 use anyhow::ensure;
 use num::pow::Pow;
 use num::traits::Inv;

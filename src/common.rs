@@ -1,4 +1,4 @@
-use std::ops::{Not, Rem};
+use std::ops::Rem;
 
 use generic_array::{ArrayLength, GenericArray};
 use grid::Grid;

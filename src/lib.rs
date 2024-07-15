@@ -1,3 +1,4 @@
+mod bisetmap;
 mod common;
 pub mod data_square;
 pub mod error;

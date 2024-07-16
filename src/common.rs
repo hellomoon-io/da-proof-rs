@@ -16,7 +16,10 @@ impl<T: ArrayLength + Rem<U64, Output = U0> + IsNotEqual<U0> + std::fmt::Debug> 
 /// Type aliases
 
 pub type Share<Sz> = GenericArray<u8, Sz>;
-pub type MerkleRoot = [u8; 32];
+
+pub type Sha256Hash = [u8; 32];
+pub type MerkleRoot = Sha256Hash;
+
 pub(crate) type Square<Sz> = Grid<Share<Sz>>;
 
 /// Wrapped Sha256 Merkle proof

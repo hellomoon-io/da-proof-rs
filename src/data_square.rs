@@ -1,3 +1,5 @@
+use std::collections::HashSet;
+
 use crate::bisetmap::BisetMap;
 use crate::common::MerkleProof;
 use crate::util::{as_chunks, as_chunks_mut, as_flat, invariant, sqrt_ceil};
@@ -106,7 +108,12 @@ type MissingMap = BisetMap<usize, usize>;
 
 impl<Sz: NonZeroMultipleOf64> ByzantineData<Sz> {
     /// Constructs a new `ByzantineDataError` with `shares` populated.
-    fn new_from_eds(eds: &ExtendedDataSquare<Sz>, axis: Axis, idx: usize) -> Self {
+    fn new_from_eds(
+        eds: &ExtendedDataSquare<Sz>,
+        axis: Axis,
+        idx: usize,
+        missing_indices_opt: Option<&HashSet<usize>>,
+    ) -> Self {
         Self {
             axis,
             idx,
@@ -114,7 +121,18 @@ impl<Sz: NonZeroMultipleOf64> ByzantineData<Sz> {
                 Axis::Row => eds.square.0.iter_row(idx),
                 Axis::Col => eds.square.0.iter_col(idx),
             })
-            .map(ToOwned::to_owned)
+            .enumerate()
+            .map(|(idx, share)| {
+                // If the index is considered missing, we don't want to trust it so we don't
+                // include it in the known list of shares.
+                if missing_indices_opt
+                    .map_or(false, |missing_indices| missing_indices.contains(&idx))
+                {
+                    None
+                } else {
+                    Some(share.clone())
+                }
+            })
             .collect_vec(),
         }
     }
@@ -326,8 +344,6 @@ impl RepairStep {
 }
 
 impl<Sz: NonZeroMultipleOf64> ExtendedDataSquare<Sz> {
-    /// TODO: verify encoding
-
     /// Before executing a repair, check if the slice is valid.
     ///
     /// No-op if the slice is incomplete (according to the user).
@@ -346,12 +362,11 @@ impl<Sz: NonZeroMultipleOf64> ExtendedDataSquare<Sz> {
                 Axis::Row => &self.row_roots,
                 Axis::Col => &self.col_roots,
             };
-            let expected_root = roots
-                .get(idx)
-                .ok_or_else(|| ByzantineData::new_from_eds(self, axis, idx))?;
+            let expected_root = roots[idx];
             let calculated_root = compute_root(&self.square.0, axis, idx)?;
-            if expected_root != &calculated_root {
-                Err(ByzantineData::new_from_eds(self, axis, idx).into())
+            if expected_root != calculated_root {
+                // There are no missing indices
+                Err(ByzantineData::new_from_eds(self, axis, idx, None).into())
             } else {
                 Ok(())
             }
@@ -432,11 +447,13 @@ impl<Sz: NonZeroMultipleOf64> ExtendedDataSquare<Sz> {
                     .collect_vec();
                 let tree = MerkleTree::<Sha256>::from_leaves(&leaves);
                 tree.root()
-                    .ok_or_else(|| ByzantineData::new_from_eds(self, axis, idx))
+                    .ok_or_else(|| UnableToConstructMerkleRoot::Axis(axis, idx))
             }?;
 
             if calculated_root != expected_root {
-                return Err(ByzantineData::new_from_eds(self, axis, idx).into());
+                return Err(
+                    ByzantineData::new_from_eds(self, axis, idx, Some(&missing_indices)).into(),
+                );
             }
 
             missing_indices.iter().try_for_each(|jdx| {
@@ -491,13 +508,14 @@ impl<Sz: NonZeroMultipleOf64> ExtendedDataSquare<Sz> {
                             .collect_vec();
                         let tree = MerkleTree::<Sha256>::from_leaves(&leaves);
                         tree.root()
-                            .ok_or_else(|| ByzantineData::new_from_eds(self, axis.ortho(), *jdx))
+                            .ok_or(UnableToConstructMerkleRoot::Axis(axis.ortho(), *jdx))
                     }?;
 
                     // Invariant: the computed Merkle root of the slice should match the "known" one.
                     invariant!(
                         ortho_expected_root == ortho_calculated_root,
-                        ByzantineData::new_from_eds(self, axis.ortho(), *jdx).into()
+                        // There are no missing orthogonal indices
+                        ByzantineData::new_from_eds(self, axis.ortho(), *jdx, None).into()
                     );
 
                     let shares_view = ortho_iter
@@ -516,7 +534,8 @@ impl<Sz: NonZeroMultipleOf64> ExtendedDataSquare<Sz> {
                     // Invariant: the parity data of the shares should match the recomputed parity.
                     invariant!(
                         &shares_view[..self.original_width] == &parity_view[..],
-                        ByzantineData::new_from_eds(self, axis.ortho(), *jdx).into()
+                        // There are no missing orthogonal indices
+                        ByzantineData::new_from_eds(self, axis.ortho(), *jdx, None).into()
                     )
                 }
 
@@ -596,7 +615,7 @@ impl<Sz: NonZeroMultipleOf64> ExtendedDataSquare<Sz> {
         let tree = MerkleTree::<Sha256>::from_leaves(&leaves[..]);
         let idx = match axis {
             Axis::Row => idx,
-            Axis::Col => self.original_width * 2 + 1,
+            Axis::Col => self.original_width * 2 + idx,
         };
         tree.proof(&[idx]).into()
     }
@@ -619,6 +638,24 @@ impl<Sz: NonZeroMultipleOf64> ExtendedDataSquare<Sz> {
             &[Sha256::hash(&self.square.0[(row, col)])],
             self.original_width * 2,
         )
+    }
+
+    pub fn verify_merkle_proof_axis(
+        &self,
+        axis: Axis,
+        idx: usize,
+        merkle_proof: &MerkleProof,
+    ) -> bool {
+        self.data_root().map_or(false, |root| {
+            let (leaf_hash, idx) = match axis {
+                Axis::Row => (self.row_roots[idx], idx),
+                Axis::Col => (self.col_roots[idx], self.original_width * 2 + idx),
+            };
+
+            merkle_proof
+                .0
+                .verify(root, &[idx], &[leaf_hash], self.original_width * 4)
+        })
     }
 }
 
@@ -738,7 +775,11 @@ mod test {
         let mut eds = ds.extend().unwrap();
         eds.row_roots[0][0] = !eds.row_roots[0][0];
         let err = eds.repair(&[]).unwrap_err();
-        assert!(err.is::<ByzantineData<U256>>())
+        let byzantine_data = err.downcast_ref::<ByzantineData<U256>>().unwrap();
+
+        // The error should have been returned in the preflight stage, which only happens if all
+        // the data is present in the slice.
+        assert!(byzantine_data.shares.iter().all(Option::is_some))
     }
 
     #[test]
@@ -747,7 +788,12 @@ mod test {
         let mut eds = ds.extend().unwrap();
         eds.row_roots[0][0] = !eds.row_roots[0][0];
         let err = eds.repair(&[(0, 0)]).unwrap_err();
-        assert!(err.is::<ByzantineData<U256>>())
+        let byzantine_data = err.downcast_ref::<ByzantineData<U256>>().unwrap();
+
+        // This error should be returned after repairing (0, 0), so the first share should be `None`
+        let mut iter = byzantine_data.shares.iter();
+        assert!(iter.next().unwrap().is_none());
+        assert!(iter.all(Option::is_some));
     }
 
     #[test]
@@ -764,11 +810,11 @@ mod test {
         let ds = make_ds::<4>();
         let mut eds = ds.extend().unwrap();
         eds.square.0[(1, 0)] = new_share();
-
         eds.col_roots[0] = compute_root(&eds.square.0, Axis::Col, 0).unwrap();
-
         let err = eds.repair(&[(0, 0)]).unwrap_err();
-        assert!(err.is::<ByzantineData<U256>>())
+        let byzantine_data = err.downcast_ref::<ByzantineData<U256>>().unwrap();
+
+        assert!(byzantine_data.shares.iter().all(Option::is_some))
     }
 
     #[test]
@@ -807,7 +853,7 @@ mod test {
     }
 
     #[test]
-    fn merkle_proof_verification_ok() {
+    fn merkle_proof_share_verification_ok() {
         let ds = make_ds::<4>();
         let eds = ds.extend().unwrap();
         let proof = eds.merkle_proof_share(Axis::Row, 1, 1);
@@ -815,10 +861,18 @@ mod test {
     }
 
     #[test]
-    fn merkle_proof_verification_err() {
+    fn merkle_proof_share_verification_err() {
         let ds = make_ds::<4>();
         let eds = ds.extend().unwrap();
         let proof = eds.merkle_proof_share(Axis::Row, 1, 1);
         assert!(!eds.verify_merkle_proof_share(Axis::Row, 1, 2, &proof));
+    }
+
+    #[test]
+    fn merkle_proof_axis_verification() {
+        let ds = make_ds::<4>();
+        let eds = ds.extend().unwrap();
+        let proof = eds.merkle_proof_axis(Axis::Col, 0);
+        assert!(eds.verify_merkle_proof_axis(Axis::Col, 0, &proof))
     }
 }

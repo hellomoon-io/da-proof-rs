@@ -1,6 +1,6 @@
 use generic_array::ArrayLength;
 
-use crate::common::{Axis, Share};
+use crate::common::{Axis, NonZeroMultipleOf64, Share};
 
 /// An error that is returned when Byzantine (invalid, malicious, etc.) data is detected.
 ///
@@ -12,9 +12,11 @@ pub struct ByzantineData<Sz: ArrayLength> {
     pub axis: Axis,
     /// The index of the axis on which Byzantine data was detected
     pub idx: usize,
-    /// The shares that could be used to construct a fraud proof.
-    pub shares: Vec<Share<Sz>>,
+    /// The shares that could be used to construct a fraud proof
+    pub shares: Vec<Option<Share<Sz>>>,
 }
+
+impl<Sz: NonZeroMultipleOf64> ByzantineData<Sz> {}
 
 impl<Sz: ArrayLength> std::fmt::Display for ByzantineData<Sz> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -104,7 +106,7 @@ pub enum UnableToConstructMerkleRoot {
 
 impl std::fmt::Display for UnableToConstructMerkleRoot {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "unable to construct merkle root ");
+        write!(f, "unable to construct merkle root ")?;
         match self {
             UnableToConstructMerkleRoot::Axis(axis, col) => write!(f, "for {axis}, {col}"),
             UnableToConstructMerkleRoot::Data => write!(f, "for data"),

@@ -2,7 +2,7 @@ use std::collections::HashSet;
 
 use crate::bisetmap::BisetMap;
 use crate::common::MerkleProof;
-use crate::util::{as_chunks, as_chunks_mut, as_flat, invariant, sqrt_ceil};
+use crate::util::{as_chunks, as_chunks_mut, as_flat, as_shares_rem, invariant, sqrt_ceil};
 use borsh::{BorshDeserialize, BorshSerialize};
 use generic_array::{ArrayLength, GenericArray};
 use grid::Grid;
@@ -25,6 +25,10 @@ use crate::error::{
 pub struct DataSquare<Sz: NonZeroMultipleOf64>(Square<Sz>);
 
 impl<Sz: NonZeroMultipleOf64> BorshSerialize for DataSquare<Sz> {
+    /// Serialization structure:
+    /// - the size of the shares (as a `u64`)
+    /// - the width of the matrix (as a `u64`)
+    /// - the flattened array (as rows)
     fn serialize<W: std::io::Write>(&self, writer: &mut W) -> std::io::Result<()> {
         // Serialize the size of the shares
         Sz::U64.serialize(writer)?;
@@ -37,6 +41,7 @@ impl<Sz: NonZeroMultipleOf64> BorshSerialize for DataSquare<Sz> {
 }
 
 impl<Sz: NonZeroMultipleOf64> BorshDeserialize for DataSquare<Sz> {
+    /// See `serialize` for structure
     fn deserialize_reader<R: std::io::Read>(reader: &mut R) -> std::io::Result<Self> {
         let sz = u64::deserialize_reader(reader)?;
         invariant!(
@@ -80,6 +85,11 @@ pub struct ExtendedDataSquare<Sz: NonZeroMultipleOf64> {
 }
 
 impl<Sz: NonZeroMultipleOf64> BorshSerialize for ExtendedDataSquare<Sz> {
+    /// Serialization structure:
+    /// - the original width (as a `u64`)
+    /// - the square itself (see `DataSquare`)
+    /// - the row roots
+    /// - the column roots
     fn serialize<W: std::io::Write>(&self, writer: &mut W) -> std::io::Result<()> {
         (self.original_width as u64).serialize(writer)?;
         self.square.serialize(writer)?;
@@ -89,6 +99,7 @@ impl<Sz: NonZeroMultipleOf64> BorshSerialize for ExtendedDataSquare<Sz> {
 }
 
 impl<Sz: NonZeroMultipleOf64> BorshDeserialize for ExtendedDataSquare<Sz> {
+    /// See `serialize` for structure
     fn deserialize_reader<R: std::io::Read>(reader: &mut R) -> std::io::Result<Self> {
         let original_width = u64::deserialize_reader(reader)?;
         let square = DataSquare::<Sz>::deserialize_reader(reader)?;
@@ -139,7 +150,8 @@ impl<Sz: NonZeroMultipleOf64> ByzantineData<Sz> {
 }
 
 impl TooManyErasures {
-    fn new_from_missing_map(missing_map: &MissingMap) -> Self {
+    /// Constructs the error from a map of missing indices.
+    fn from_missing_map(missing_map: &MissingMap) -> Self {
         Self {
             missing: missing_map.flat_iter().collect_vec(),
         }
@@ -164,6 +176,7 @@ fn compute_root<Sz: ArrayLength>(
         .ok_or(UnableToConstructMerkleRoot::Axis(axis, idx).into())
 }
 
+/// Computes a Merkle proof for `square` via `axis` at `(row, col)`.
 fn compute_proof<Sz: ArrayLength>(
     square: &Square<Sz>,
     axis: Axis,
@@ -180,25 +193,53 @@ fn compute_proof<Sz: ArrayLength>(
 }
 
 impl<Sz: NonZeroMultipleOf64> DataSquare<Sz> {
+    /// Constructs a new `DataSquare` from a flat byte array.
+    ///
+    /// `data` will be subdivided into `Sz`-sized chunks and put into a square matrix.
+    ///
+    /// The square will be padded if `data.len() % Sz != 0` or if the resulting list of shares is not square.
+    pub fn from_bytes<T: AsRef<[u8]>>(data: &T) -> Self {
+        let (shares, rem) = as_shares_rem::<Sz>(data.as_ref());
+
+        if rem.is_empty() {
+            Self::from_shares_pad(shares)
+        } else {
+            // Add 1 for the remainder.
+            let width = sqrt_ceil(shares.len() + 1);
+            let ga = GenericArray::<u8, Sz>::default();
+            let mut inner: Square<Sz> = Grid::init(width, width, ga);
+            (0..width).for_each(|row_idx| {
+                inner
+                    .iter_row_mut(row_idx)
+                    .enumerate()
+                    .for_each(|(i, elt)| match shares.get(row_idx * width + i) {
+                        Some(share) => *elt = share.clone(),
+                        None => (),
+                    })
+            });
+
+            // Clone the remainder into the grid.
+            inner[(shares.len() / width, shares.len() % width)][..rem.len()].clone_from_slice(rem);
+
+            Self(inner)
+        }
+    }
+
     /// Constructs a new `DataSquare` from a flat slice containing `Share`s.
     ///
     /// Pads the square if the number of shares is not a perfect square.
-    pub fn new_pad(data: &[Share<Sz>]) -> Self {
+    pub fn from_shares_pad(data: &[Share<Sz>]) -> Self {
         let width = sqrt_ceil(data.len());
 
-        let ga = GenericArray::<u8, Sz>::default();
-
-        let mut inner: Square<Sz> = Grid::init(width, width, ga);
+        let mut inner: Square<Sz> = Grid::init(width, width, new_share());
 
         (0..width).for_each(|row_idx| {
             inner
                 .iter_row_mut(row_idx)
                 .enumerate()
-                .for_each(|(i, elt)| {
-                    *elt = match data.get(row_idx * width + i) {
-                        Some(share) => share.clone(),
-                        None => new_share(),
-                    }
+                .for_each(|(i, elt)| match data.get(row_idx * width + i) {
+                    Some(share) => *elt = share.clone(),
+                    None => (),
                 });
         });
 
@@ -208,7 +249,7 @@ impl<Sz: NonZeroMultipleOf64> DataSquare<Sz> {
     /// Constructs a `DataSquare` from a flat slice containing `Share`s.
     ///
     /// Returns `Err(_)` if the length of the input is not a perfect square.
-    pub fn new(data: &[Share<Sz>]) -> anyhow::Result<Self> {
+    pub fn from_shares(data: &[Share<Sz>]) -> anyhow::Result<Self> {
         let width = sqrt(data.len());
 
         invariant!(
@@ -216,7 +257,7 @@ impl<Sz: NonZeroMultipleOf64> DataSquare<Sz> {
             DataNotSquare { len: data.len() }.into()
         );
 
-        Ok(Self::new_pad(data))
+        Ok(Self::from_shares_pad(data))
     }
 
     /// Erasure encodes `self` using `width` rows & columns.
@@ -325,16 +366,16 @@ struct RepairStep {
     progress_made: bool,
 }
 
-impl Default for RepairStep {
-    fn default() -> Self {
-        Self {
-            solved: true,
-            progress_made: false,
-        }
-    }
-}
-
 impl RepairStep {
+    /// The initial state of repairs.
+    ///
+    /// Solved is `true` by default.
+    pub const INITIAL: Self = Self {
+        solved: true,
+        progress_made: false,
+    };
+
+    /// Joins two repair steps into a single one (monoid).
     fn join(&self, other: &Self) -> Self {
         Self {
             solved: self.solved && other.solved,
@@ -344,6 +385,11 @@ impl RepairStep {
 }
 
 impl<Sz: NonZeroMultipleOf64> ExtendedDataSquare<Sz> {
+    /// Returns the optional share at (row_idx, col_idx).
+    pub fn get_share(&self, row_idx: usize, col_idx: usize) -> Option<&Share<Sz>> {
+        self.square.0.get(row_idx, col_idx)
+    }
+
     /// Before executing a repair, check if the slice is valid.
     ///
     /// No-op if the slice is incomplete (according to the user).
@@ -496,7 +542,8 @@ impl<Sz: NonZeroMultipleOf64> ExtendedDataSquare<Sz> {
                 // We already upated it in the square, but we haven't removed it from the map of
                 // missing indices.
                 let ortho_complete = ortho_missing_opt.map_or(false, |ortho_missing| {
-                    ortho_missing.len() == 1 && ortho_missing.contains(jdx)
+                    let mut iter = ortho_missing.iter();
+                    iter.next() == Some(jdx) && iter.next().is_none()
                 });
 
                 if ortho_complete {
@@ -562,7 +609,7 @@ impl<Sz: NonZeroMultipleOf64> ExtendedDataSquare<Sz> {
     fn solve(&mut self, missing: &mut MissingMap) -> anyhow::Result<()> {
         loop {
             let repair_step: RepairStep =
-                (0..self.original_width * 2).try_fold(RepairStep::default(), |acc, i| {
+                (0..self.original_width * 2).try_fold(RepairStep::INITIAL, |acc, i| {
                     let row_repair_step = self.solve_slice(Axis::Row, i, missing)?;
                     let col_repair_step = self.solve_slice(Axis::Col, i, missing)?;
 
@@ -572,7 +619,7 @@ impl<Sz: NonZeroMultipleOf64> ExtendedDataSquare<Sz> {
             if repair_step.solved {
                 return Ok(());
             } else if !repair_step.progress_made {
-                return Err(TooManyErasures::new_from_missing_map(missing).into());
+                return Err(TooManyErasures::from_missing_map(missing).into());
             }
         }
     }
@@ -589,7 +636,7 @@ impl<Sz: NonZeroMultipleOf64> ExtendedDataSquare<Sz> {
         Ok(())
     }
 
-    pub fn data_root(&self) -> anyhow::Result<MerkleRoot> {
+    fn data_tree(&self) -> MerkleTree<Sha256> {
         let leaves = self
             .row_roots
             .iter()
@@ -597,22 +644,35 @@ impl<Sz: NonZeroMultipleOf64> ExtendedDataSquare<Sz> {
             .map(ToOwned::to_owned)
             .collect_vec();
 
-        let tree = MerkleTree::<Sha256>::from_leaves(&leaves[..]);
-        tree.root().ok_or(UnableToConstructMerkleRoot::Data.into())
+        MerkleTree::<Sha256>::from_leaves(&leaves[..])
     }
 
+    /// Computes the data root, i.e. the root of the Merkle tree with the row and column roots as
+    /// leaves.
+    pub fn data_root(&self) -> anyhow::Result<MerkleRoot> {
+        self.data_tree()
+            .root()
+            .ok_or(UnableToConstructMerkleRoot::Data.into())
+    }
+
+    /// The row-wise Merkle roots of the table.
+    pub fn row_roots(&self) -> &Vec<MerkleRoot> {
+        &self.row_roots
+    }
+
+    /// The column-wise Merkle roots of the table.
+    pub fn col_roots(&self) -> &Vec<MerkleRoot> {
+        &self.col_roots
+    }
+
+    /// Computes a Merkle proof via `axis` for `(row, col)`.
     pub fn merkle_proof_share(&self, axis: Axis, row: usize, col: usize) -> MerkleProof {
         compute_proof(&self.square.0, axis, row, col)
     }
 
+    /// Computes a Merkle proof for `axis` `idx`.
     pub fn merkle_proof_axis(&self, axis: Axis, idx: usize) -> MerkleProof {
-        let leaves = self
-            .row_roots
-            .iter()
-            .chain(self.col_roots.iter())
-            .map(ToOwned::to_owned)
-            .collect_vec();
-        let tree = MerkleTree::<Sha256>::from_leaves(&leaves[..]);
+        let tree = self.data_tree();
         let idx = match axis {
             Axis::Row => idx,
             Axis::Col => self.original_width * 2 + idx,
@@ -620,6 +680,7 @@ impl<Sz: NonZeroMultipleOf64> ExtendedDataSquare<Sz> {
         tree.proof(&[idx]).into()
     }
 
+    /// Verifies `merkle_proof` as being via `axis` for `(row, col)`.
     pub fn verify_merkle_proof_share(
         &self,
         axis: Axis,
@@ -640,11 +701,12 @@ impl<Sz: NonZeroMultipleOf64> ExtendedDataSquare<Sz> {
         )
     }
 
+    /// Verifies `merkle_proof` as being for `axis` `idx`.
     pub fn verify_merkle_proof_axis(
         &self,
         axis: Axis,
         idx: usize,
-        merkle_proof: &MerkleProof,
+        merkle_proof: &MerkleProof
     ) -> bool {
         self.data_root().map_or(false, |root| {
             let (leaf_hash, idx) = match axis {
@@ -672,13 +734,24 @@ mod test {
             i = i + 1;
             arr![i; 256]
         });
-        DataSquare::new_pad(&arr)
+        DataSquare::from_shares_pad(&arr)
     }
 
     #[test]
     fn extension() {
         let ds = make_ds::<4>();
         let _eds = ds.extend(); // The debug assert should fail if this test doesn't pass
+    }
+
+    #[test]
+    fn from_bytes() {
+        let v = (0..514).map(|x| (x % 16) as u8).collect_vec();
+        let ds = DataSquare::<U256>::from_bytes(&v);
+        assert_eq!(ds.0[(0, 0)], ds.0[(0, 1)]);
+        assert_eq!(ds.0[(1, 0)][0], 0);
+        assert_eq!(ds.0[(1, 0)][1], 1);
+        assert_eq!(ds.0[(1, 0)][2], 0);
+        assert_eq!(ds.0[(1, 1)], arr![0u8; 256]);
     }
 
     #[test]
@@ -731,8 +804,7 @@ mod test {
     #[test]
     fn extension_repair_too_many_erasures() {
         let ds = make_ds::<4>();
-        let eds0 = ds.extend().unwrap();
-        let mut eds1 = eds0.clone();
+        let mut eds = ds.extend().unwrap();
         // -----------------
         // | x |   | x | x |
         // |---|---|---|---|
@@ -761,11 +833,11 @@ mod test {
 
         // Zero out the shares that we are "missing"
         for (row_idx, col_idx) in missing {
-            let share = unsafe { eds1.square.0.get_unchecked_mut(row_idx, col_idx) };
+            let share = unsafe { eds.square.0.get_unchecked_mut(row_idx, col_idx) };
             *share = new_share()
         }
 
-        let err = eds1.repair(&missing).unwrap_err();
+        let err = eds.repair(&missing).unwrap_err();
         assert!(err.is::<TooManyErasures>())
     }
 

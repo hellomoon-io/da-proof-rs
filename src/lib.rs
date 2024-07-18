@@ -1,5 +1,5 @@
 mod bisetmap;
-mod common;
+pub mod common;
 pub mod data_square;
 pub mod error;
 pub mod gf16;

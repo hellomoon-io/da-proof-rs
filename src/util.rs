@@ -126,6 +126,13 @@ pub fn as_shares<Sz: NonZeroMultipleOf64>(slice: &[u8]) -> anyhow::Result<&[Shar
     Ok(GenericArray::<u8, Sz>::chunks_from_slice(slice).0)
 }
 
+/// Returns a view of `slice` as shares.
+///
+/// The second argument of the tuple is the "remainder".
+pub fn as_shares_rem<Sz: NonZeroMultipleOf64>(slice: &[u8]) -> (&[Share<Sz>], &[u8]) {
+    GenericArray::<u8, Sz>::chunks_from_slice(slice)
+}
+
 #[cfg(test)]
 mod test {
     use typenum::U64;

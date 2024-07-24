@@ -1,0 +1,7 @@
+/target
+
+# Python virtual env
+/venv
+
+# Jupyter checkpoints
+/.ipynb_checkpoints

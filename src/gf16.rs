@@ -5,11 +5,10 @@
 //!
 //! A 16-bit Galois field is used in the data availability proof.
 
+use crate::common::TWO_TO_SIXTEEEN;
 use crate::gf16_lut::LUT;
 
 use crate::util::BitLength;
-
-const TWO_TO_SIXTEEEN: usize = 1 << 16;
 
 /// An irreducible polynomial of degree 16.
 ///
@@ -107,6 +106,40 @@ impl GF16 {
                 .unwrap(),
         )
     }
+
+    pub fn slice_from_u16_slice<'a>(slice: &'a [u16]) -> &'a [Self] {
+        unsafe { std::slice::from_raw_parts(slice.as_ptr() as *const Self, slice.len()) }
+    }
+
+    pub fn slice_mut_from_u16_slice<'a>(slice: &'a mut [u16]) -> &'a mut [Self] {
+        unsafe { std::slice::from_raw_parts_mut(slice.as_mut_ptr() as *mut Self, slice.len()) }
+    }
+
+    pub fn u16_slice_from_slice<'a>(slice: &'a [Self]) -> &'a [u16] {
+        unsafe { std::slice::from_raw_parts(slice.as_ptr() as *const u16, slice.len()) }
+    }
+
+    pub fn vec_from_u16_vec(vec: Vec<u16>) -> Vec<Self> {
+        unsafe {
+            let ptr = vec.as_ptr() as *mut Self;
+            let len = vec.len();
+            let cap = vec.capacity();
+            std::mem::forget(vec);
+
+            Vec::from_raw_parts(ptr, len, cap)
+        }
+    }
+
+    pub fn u16_vec_from_vec(vec: Vec<Self>) -> Vec<u16> {
+        unsafe {
+            let ptr = vec.as_ptr() as *mut u16;
+            let len = vec.len();
+            let cap = vec.capacity();
+            std::mem::forget(vec);
+
+            Vec::from_raw_parts(ptr, len, cap)
+        }
+    }
 }
 
 impl num::traits::Zero for GF16 {
@@ -116,6 +149,12 @@ impl num::traits::Zero for GF16 {
 
     fn is_zero(&self) -> bool {
         self.0 == 0
+    }
+}
+
+impl num::traits::One for GF16 {
+    fn one() -> Self {
+        1.into()
     }
 }
 
@@ -216,11 +255,17 @@ impl std::ops::Div for GF16 {
 }
 
 /// Constant time exponentiation using pre-generated lookup tables.
-impl num::traits::Pow<GF16> for GF16 {
+impl num::traits::Pow<i64> for GF16 {
     type Output = GF16;
 
-    fn pow(self, rhs: GF16) -> Self::Output {
-        LUT.exp[(LUT.log[self.0 as usize].0 as usize * rhs.0 as usize) % (TWO_TO_SIXTEEEN - 1)]
+    fn pow(self, rhs: i64) -> Self::Output {
+        let mut i = LUT.log[self.0 as usize].0 as i64 * rhs % (TWO_TO_SIXTEEEN - 1) as i64;
+
+        if i < 0 {
+            i += (TWO_TO_SIXTEEEN - 1) as i64;
+        }
+
+        LUT.exp[i as usize]
     }
 }
 
@@ -233,24 +278,27 @@ impl num::traits::Inv for GF16 {
     }
 }
 
-mod poly {
+pub mod poly {
     use num::Zero;
     use std::cmp::max;
 
     use super::GF16;
 
     #[derive(Debug, Clone, PartialEq)]
-    pub struct Poly(Vec<GF16>);
+    pub struct Poly(pub(crate) Vec<GF16>);
 
     #[derive(Debug, Clone)]
     pub struct Term {
-        coef: GF16,
+        coeff: GF16,
         degree: usize,
     }
 
     impl Term {
         pub fn new(coef: GF16, degree: usize) -> Self {
-            Self { coef, degree }
+            Self {
+                coeff: coef,
+                degree,
+            }
         }
     }
 
@@ -260,9 +308,29 @@ mod poly {
         fn add(self, rhs: Term) -> Self::Output {
             let mut vec_self = vec![GF16::zero(); self.degree + 1];
             let mut vec_rhs = vec![GF16::zero(); rhs.degree + 1];
-            vec_self[0] = self.coef;
-            vec_rhs[0] = rhs.coef;
+            vec_self[0] = self.coeff;
+            vec_rhs[0] = rhs.coeff;
             Poly(vec_self) + Poly(vec_rhs)
+        }
+    }
+
+    impl From<Term> for Poly {
+        fn from(value: Term) -> Self {
+            let mut vec = vec![GF16::zero(); value.degree + 1];
+            vec[0] = value.coeff;
+            Poly(vec)
+        }
+    }
+
+    impl From<Vec<GF16>> for Poly {
+        fn from(value: Vec<GF16>) -> Self {
+            Self(value)
+        }
+    }
+
+    impl From<Poly> for Vec<GF16> {
+        fn from(value: Poly) -> Self {
+            value.0
         }
     }
 
@@ -301,8 +369,8 @@ mod poly {
     /// Polynomial addition using the standard "whiteboard" method.
     ///
     /// The result stays within GF(2^16).
-    impl std::ops::Add for Poly {
-        type Output = Self;
+    impl std::ops::Add for &Poly {
+        type Output = Poly;
 
         fn add(self, rhs: Self) -> Self::Output {
             let sz = max(self.0.len(), rhs.0.len());
@@ -317,6 +385,14 @@ mod poly {
         }
     }
 
+    impl std::ops::Add for Poly {
+        type Output = Self;
+
+        fn add(self, rhs: Self) -> Self::Output {
+            &self + &rhs
+        }
+    }
+
     /// Adds a term to the polynomial.
     impl std::ops::Add<Term> for Poly {
         type Output = Self;
@@ -324,7 +400,7 @@ mod poly {
         fn add(self, rhs: Term) -> Self::Output {
             // First we construct a temporary polynomial including just `rhs`, and add that to `self`.
             let mut rhs_vec = vec![GF16::zero(); rhs.degree + 1];
-            rhs_vec[0] = rhs.coef;
+            rhs_vec[0] = rhs.coeff;
             self + Poly(rhs_vec)
         }
     }
@@ -332,8 +408,8 @@ mod poly {
     /// Polynomial multiplication using the standard "whiteboard" method.
     ///
     /// The result stays within GF(2^16).
-    impl std::ops::Mul for Poly {
-        type Output = Self;
+    impl std::ops::Mul for &Poly {
+        type Output = Poly;
 
         fn mul(self, rhs: Self) -> Self::Output {
             let sz = self.0.len() + rhs.0.len() - 1;
@@ -347,29 +423,46 @@ mod poly {
         }
     }
 
-    /// Synthetic division for polynomials, optimized for GF(2^16).
-    impl std::ops::Div for Poly {
-        type Output = (Self, Self);
+    impl std::ops::Mul for Poly {
+        type Output = Self;
 
-        fn div(mut self, rhs: Self) -> Self::Output {
+        fn mul(self, rhs: Self) -> Self::Output {
+            &self * &rhs
+        }
+    }
+
+    /// Synthetic division for polynomials, optimized for GF(2^16).
+    impl std::ops::Div for &Poly {
+        type Output = (Poly, Poly);
+
+        fn div(self, rhs: Self) -> Self::Output {
             let divisor_degree = rhs.0.len() - 1;
             if self.0.len() < divisor_degree {
-                (Self(vec![]), self)
+                (Poly(vec![]), self.clone())
             } else {
-                for i in 0..(self.0.len() - divisor_degree) {
-                    let coef = self.0[i];
+                let mut res = self.clone();
+                for i in 0..(res.0.len() - divisor_degree) {
+                    let coef = res.0[i];
                     if coef != GF16::zero() {
                         for j in 1..rhs.0.len() {
                             if rhs.0[j] != GF16::zero() {
-                                self.0[i + j] += rhs.0[j] * coef;
+                                res.0[i + j] += rhs.0[j] * coef;
                             }
                         }
                     }
                 }
 
-                let sep = self.0.len() - (rhs.0.len() - 1);
-                (Self(self.0[..sep].into()), Self(self.0[sep..].into()))
+                let sep = res.0.len() - (rhs.0.len() - 1);
+                (Poly(res.0[..sep].into()), Poly(res.0[sep..].into()))
             }
+        }
+    }
+
+    impl std::ops::Div for Poly {
+        type Output = (Self, Self);
+
+        fn div(self, rhs: Self) -> Self::Output {
+            &self / &rhs
         }
     }
 
@@ -394,6 +487,21 @@ mod test {
 
     use super::poly::*;
     use super::*;
+
+    #[test]
+    fn slice_to_u16_slice() {
+        let arr: [u16; 2] = [0xdead, 0xbeef];
+        assert_eq!(
+            GF16::slice_from_u16_slice(&arr),
+            &[0xdead.into(), 0xbeef.into()]
+        )
+    }
+
+    #[test]
+    fn u16_slice_to_slice() {
+        let arr: [GF16; 2] = [0xdead.into(), 0xbeef.into()];
+        assert_eq!(GF16::u16_slice_from_slice(&arr), &[0xdead, 0xbeef])
+    }
 
     #[test]
     fn lut_entries_unique() {
@@ -430,16 +538,15 @@ mod test {
     }
 
     #[quickcheck_macros::quickcheck]
-    #[ignore] // This is pretty slow since it does a lot of slow multiplication
-    fn pow_isomorphism(a: u16, b_: u16) {
+    #[ignore]
+    fn pow_isomorphism(a: u16, b: u16) {
         let a = GF16(a);
-        let b = GF16(b_);
-        let powed = a.pow(b);
-        if a == 0.into() || b == 0.into() {
+        let powed = a.pow(b as i64);
+        if a == 0.into() || b == 0 {
             assert_eq!(powed, 1.into(), "{} ** {} == {} != 1", a, b, powed);
         } else {
-            let muled = (1..(b_ as usize) + 1).fold(GF16(1), |acc, _| acc * a);
-            assert_eq!(a.pow(b), muled, "{} ** {} == {} != {}", a, b, powed, muled);
+            let muled = (1..(b as usize) + 1).fold(GF16(1), |acc, _| acc * a);
+            assert_eq!(powed, muled, "{} ** {} == {} != {}", a, b, powed, muled);
         }
     }
 
@@ -486,7 +593,7 @@ mod test {
             + Term::new(0x36.into(), 2)
             + Term::new(0x78.into(), 1);
 
-        let (q, r) = dividend.clone() / divisor.clone();
+        let (q, r) = &dividend / &divisor;
 
         // The following results are from the galois Python library.
         //

@@ -6,7 +6,17 @@ edition = "2021"
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
+anyhow = "1.0.86"
+borsh = { version = "1.5.1", features = ["derive"] }
+generic-array = "1.1.0"
+grid = "0.14.0"
+itertools = "0.13.0"
 num = "0.4.3"
+rand = "0.8.5"
+reed-solomon-erasure = { version = "6.0.0", features = ["simd-accel"] }
+reed-solomon-simd = "2.2.2"
+rs_merkle = "1.4.2"
+typenum = "1.17.0"
 
 [dev-dependencies]
 quickcheck = "1.0.3"
